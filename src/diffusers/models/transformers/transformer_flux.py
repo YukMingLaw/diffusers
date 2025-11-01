@@ -272,6 +272,27 @@ class FluxIPAdapterAttnProcessor(torch.nn.Module):
             return hidden_states
 
 
+class RMSNormNpu(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, elementwise_affine=True):
+        """
+        RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        import torch_npu
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+        self.fused_norm = torch_npu.npu_rms_norm
+
+    def forward(self, hidden_states, if_fused=True):
+        if if_fused:
+            return self.fused_norm(hidden_states, self.weight, epsilon=self.variance_epsilon)[0]
+        else:
+            input_dtype = hidden_states.dtype
+            hidden_states = hidden_states.to(torch.float32)
+            variance = hidden_states.pow(2).mean(-1, keepdim=True)
+            hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+            return self.weight * hidden_states.to(input_dtype)
+
 class FluxAttention(torch.nn.Module, AttentionModuleMixin):
     _default_processor_cls = FluxAttnProcessor
     _available_processors = [
@@ -309,9 +330,14 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
+        
+        if is_torch_npu_available:
+            RMSNorm = RMSNormNpu
+        else:
+            RMSNorm = torch.nn.RMSNorm
 
-        self.norm_q = torch.nn.RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
-        self.norm_k = torch.nn.RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
+        self.norm_q = RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
+        self.norm_k = RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
         self.to_q = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
         self.to_k = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
         self.to_v = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
@@ -322,8 +348,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             self.to_out.append(torch.nn.Dropout(dropout))
 
         if added_kv_proj_dim is not None:
-            self.norm_added_q = torch.nn.RMSNorm(dim_head, eps=eps)
-            self.norm_added_k = torch.nn.RMSNorm(dim_head, eps=eps)
+            self.norm_added_q = RMSNorm(dim_head, eps=eps)
+            self.norm_added_k = RMSNorm(dim_head, eps=eps)
             self.add_q_proj = torch.nn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
             self.add_k_proj = torch.nn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
             self.add_v_proj = torch.nn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
@@ -360,7 +386,11 @@ class FluxSingleTransformerBlock(nn.Module):
 
         self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
-        self.act_mlp = nn.GELU(approximate="tanh")
+        if is_torch_npu_available:
+            import torch_npu
+            self.act_mlp = torch_npu.npu_fast_gelu
+        else:
+            self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
 
         self.attn = FluxAttention(
@@ -406,6 +436,18 @@ class FluxSingleTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
+class LayerNormNPU(nn.LayerNorm):
+    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
+        import torch_npu
+        super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
+        self.dim = dim
+        self.norm = torch_npu.npu_layer_norm_eval
+        
+    def forward(self, x):
+        return self.norm(
+            x, normalized_shape=[self.dim], weight=self.weight, bias=self.bias, eps=self.eps,
+        )
+
 @maybe_allow_in_graph
 class FluxTransformerBlock(nn.Module):
     def __init__(
@@ -428,10 +470,17 @@ class FluxTransformerBlock(nn.Module):
             eps=eps,
         )
 
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        if is_torch_npu_available:
+            self.norm2 = LayerNormNPU(dim, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
-        self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        if is_torch_npu_available:
+            self.norm2_context = LayerNormNPU(dim, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+            
         self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
     def forward(
