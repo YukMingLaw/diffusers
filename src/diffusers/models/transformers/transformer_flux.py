@@ -36,8 +36,15 @@ from ..embeddings import (
 )
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
-from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
-
+if is_torch_npu_available:
+    from ..normalization import AdaLayerNormContinuousNpu as AdaLayerNormContinuous
+    from ..normalization import AdaLayerNormZeroNpu as AdaLayerNormZero
+    from ..normalization import AdaLayerNormZeroSingleNpu as AdaLayerNormZeroSingle
+    
+    op_path="/root/lym/op_build/build/lib.linux-x86_64-cpython-311/ascend_ops.cpython-311-x86_64-linux-gnu.so"
+    torch.ops.load_library(op_path)
+else:
+    from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -436,18 +443,6 @@ class FluxSingleTransformerBlock(nn.Module):
         return encoder_hidden_states, hidden_states
 
 
-class LayerNormNPU(nn.LayerNorm):
-    def __init__(self, dim, eps=1e-6, elementwise_affine=False):
-        import torch_npu
-        super().__init__(dim, elementwise_affine=elementwise_affine, eps=eps)
-        self.dim = dim
-        self.norm = torch_npu.npu_layer_norm_eval
-        
-    def forward(self, x):
-        return self.norm(
-            x, normalized_shape=[self.dim], weight=self.weight, bias=self.bias, eps=self.eps,
-        )
-
 @maybe_allow_in_graph
 class FluxTransformerBlock(nn.Module):
     def __init__(
@@ -470,16 +465,10 @@ class FluxTransformerBlock(nn.Module):
             eps=eps,
         )
 
-        if is_torch_npu_available:
-            self.norm2 = LayerNormNPU(dim, elementwise_affine=False, eps=1e-6)
-        else:
-            self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
-        if is_torch_npu_available:
-            self.norm2_context = LayerNormNPU(dim, elementwise_affine=False, eps=1e-6)
-        else:
-            self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
             
         self.ff_context = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
@@ -515,8 +504,15 @@ class FluxTransformerBlock(nn.Module):
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        if is_torch_npu_available:
+            norm_hidden_states = torch.ops.ascend_ops.adalayernorm(
+                x=hidden_states, 
+                scale=scale_mlp[:, None], 
+                shift=shift_mlp[:, None], 
+                epsilson=1e-6)
+        else:
+            norm_hidden_states = self.norm2(hidden_states)
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
 
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -529,8 +525,15 @@ class FluxTransformerBlock(nn.Module):
         context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+        if is_torch_npu_available:
+            norm_encoder_hidden_states = torch.ops.ascend_ops.adalayernorm(
+                x=encoder_hidden_states, 
+                scale=c_scale_mlp[:, None], 
+                shift=c_shift_mlp[:, None], 
+                epsilson=1e-6)
+        else:
+            norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+            norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
@@ -682,6 +685,7 @@ class FluxTransformer2DModel(
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
         self.gradient_checkpointing = False
+        self.image_rotary_emb = None
 
     def forward(
         self,
@@ -766,11 +770,12 @@ class FluxTransformer2DModel(
             img_ids = img_ids[0]
 
         ids = torch.cat((txt_ids, img_ids), dim=0)
-        if is_torch_npu_available():
-            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
-            image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
-        else:
-            image_rotary_emb = self.pos_embed(ids)
+        if self.image_rotary_emb is None:
+            if is_torch_npu_available():
+                freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
+                image_rotary_emb = (freqs_cos.npu().to(hidden_states.dtype), freqs_sin.npu().to(hidden_states.dtype))
+            else:
+                image_rotary_emb = self.pos_embed(ids)
 
         if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
             ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
